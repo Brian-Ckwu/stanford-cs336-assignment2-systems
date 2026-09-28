@@ -2,6 +2,7 @@ import torch
 import timeit
 import logging
 import argparse
+import subprocess
 import numpy as np
 from functools import partial
 from torch.optim.optimizer import Optimizer
@@ -40,6 +41,11 @@ def forward_backward_optimizer(lm: BasicsTransformerLM, x: torch.Tensor, y: torc
     optimizer.zero_grad()
 
 if __name__ == "__main__":
+    not_commited = subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
+    is_git_tree_dirty = bool(not_commited)
+    if is_git_tree_dirty:
+        print("Git tree is dirty. Please commit your changes before running the benchmark.")
+        exit(1)  # NOTE: exit status 1 indicates failure
     logging.basicConfig(level=logging.INFO)  # NOTE: hard-coded for now
     args = setup_args()
     print(f"Measuring performance of {args.func_to_time} on device: {args.device} (sync == {args.sync})")
