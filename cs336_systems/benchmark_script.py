@@ -24,26 +24,20 @@ def setup_args() -> Namespace:
     args.add_argument("--func_to_time", type=str, required=True, choices=["forward", "forward_backward", "forward_backward_optimizer"])
     return args.parse_args()
 
-def forward(lm: BasicsTransformerLM, x: torch.Tensor, sync: bool = True, device: str = torch.device("cuda:0")) -> None:
+def forward(lm: BasicsTransformerLM, x: torch.Tensor) -> None:
     _ = lm(x)
-    if sync:
-        torch.cuda.synchronize(device)
 
-def forward_backward(lm: BasicsTransformerLM, x: torch.Tensor, y: torch.Tensor, sync: bool = True, device: str = torch.device("cuda:0")) -> None:
+def forward_backward(lm: BasicsTransformerLM, x: torch.Tensor, y: torch.Tensor) -> None:
     logits = lm(x)  # shape = (batch_size, seq_length, vocab_size)
     loss = torch.nn.functional.cross_entropy(input=logits.view(-1, logits.shape[-1]), target=y.view(-1))
     loss.backward()
-    if sync:
-        torch.cuda.synchronize(device)
 
-def forward_backward_optimizer(lm: BasicsTransformerLM, x: torch.Tensor, y: torch.Tensor, optimizer: Optimizer, sync: bool = True, device: str = torch.device("cuda:0")) -> None:
+def forward_backward_optimizer(lm: BasicsTransformerLM, x: torch.Tensor, y: torch.Tensor, optimizer: Optimizer) -> None:
     logits = lm(x)  # shape = (batch_size, seq_length, vocab_size)
     loss = torch.nn.functional.cross_entropy(input=logits.view(-1, logits.shape[-1]), target=y.view(-1))
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
-    if sync:
-        torch.cuda.synchronize(device)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)  # NOTE: hard-coded for now
@@ -64,19 +58,22 @@ if __name__ == "__main__":
     # Select the function to time
     match args.func_to_time:
         case "forward":
-            func = partial(forward, lm, x, sync=args.sync, device=args.device)
+            func = partial(forward, lm, x)
         case "forward_backward":
-            func = partial(forward_backward, lm, x, y, sync=args.sync, device=args.device)
+            func = partial(forward_backward, lm, x, y)
         case "forward_backward_optimizer":
-            func = partial(forward_backward_optimizer, lm, x, y, optimizer, sync=args.sync, device=args.device)
+            func = partial(forward_backward_optimizer, lm, x, y, optimizer)
     # Warm-up steps
     for _ in range(args.w_steps):
         func()
+    torch.cuda.synchronize(args.device)
     # Measurement
     per_step_secs = [None] * args.n_steps
     for i in range(args.n_steps):
         start = timeit.default_timer()
         func()
+        if args.sync:
+            torch.cuda.synchronize(args.device)
         elapsed_secs = timeit.default_timer() - start
         per_step_secs[i] = elapsed_secs
     print(per_step_secs)
