@@ -1,4 +1,5 @@
 import json
+import uuid
 import torch
 import timeit
 import logging
@@ -12,6 +13,10 @@ from torch.optim.optimizer import Optimizer
 from argparse import ArgumentParser, Namespace
 
 from cs336_basics.model import BasicsTransformerLM
+
+from pathlib import Path
+HERE = Path(__file__).resolve().parent  # .../cs336_systems
+REPO = HERE.parent
 
 def setup_args() -> Namespace:
     args = ArgumentParser()
@@ -28,10 +33,11 @@ def setup_args() -> Namespace:
     args.add_argument("--sync", action=argparse.BooleanOptionalAction, required=True, help="Whether to call torch.cuda.synchronize() after each step")
     args.add_argument("--func_to_time", type=str, required=True, choices=["forward", "forward_backward", "forward_backward_optimizer"])
     args.add_argument("--debug", action="store_true", help="Debug mode.")
+    args.add_argument("--sweep_name", type=str, required=True, help="Name of the sweep. Will be used to create the output directory.")
     return args.parse_args()
 
 def update_args_with_model_size(args: Namespace, model_size: str) -> Namespace:
-    df = pd.read_csv("configs/model_sizes.csv", index_col=0)
+    df = pd.read_csv(HERE / "configs" / "model_sizes.csv", index_col=0)
     hparams = df.loc[model_size].to_dict()
     for k, v in hparams.items():
         setattr(args, k, v)
@@ -52,19 +58,54 @@ def forward_backward_optimizer(lm: BasicsTransformerLM, x: torch.Tensor, y: torc
     optimizer.step()
     optimizer.zero_grad()
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)  # NOTE: hard-coded for now
-    args = setup_args()
-    not_commited = subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
-    is_git_tree_dirty = bool(not_commited)
-    if is_git_tree_dirty and not args.debug:
-        print("Git tree is dirty. Please commit your changes before running the benchmark.")
-        exit(1)  # NOTE: exit status 1 indicates failure
-    if args.model_size is not None:
-        print(f"Updating args with model size: {args.model_size}")
-        args = update_args_with_model_size(args, args.model_size)
-    print(f"Measuring performance of {args.func_to_time} on device: {args.device} (sync == {args.sync})")
-    pprint(f"Args: {vars(args)}")
+def get_provenance_info() -> dict:
+    import sys, shlex, socket
+    from datetime import datetime, timezone
+    def git(*cmd: str) -> str:
+        return subprocess.check_output(["git", *cmd], cwd=REPO, text=True).strip()
+
+    provenance = {
+        "git_commit": git("rev-parse", "HEAD"),
+        "command": shlex.join(sys.argv),   # import shlex, sys
+        "hostname": socket.gethostname(),  # import socket
+        "gpu": torch.cuda.get_device_name(args.device),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    return provenance
+
+def build_record(args: Namespace, provenance: dict, per_step_secs: list[float], status: str) -> dict:
+    return {
+        **provenance,
+        "model_size": args.model_size,
+        "func_to_time": args.func_to_time,
+        "d_model": args.d_model,
+        "d_ff": args.d_ff,
+        "num_layers": args.num_layers,
+        "num_heads": args.num_heads,
+        "vocab_size": args.vocab_size,
+        "context_length": args.context_length,
+        "w_steps": args.w_steps,
+        "n_steps": args.n_steps,
+        "sync": args.sync,
+        "device": str(args.device),
+        "per_step_secs": [float(x) for x in per_step_secs],
+        "mean_sec": np.mean(per_step_secs),
+        "std_sec": np.std(per_step_secs),
+        "status": status,
+    }
+
+def save_record(record: dict, folder_name: str) -> Path:
+    out_dir = HERE / "benchmark_script_results" / folder_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{args.model_size}__{args.func_to_time}__{uuid.uuid4().hex[:8]}.json"  # NOTE: uuid is used to ensure unique file name
+    out_path = out_dir / name
+    with open(out_path, "w") as f:
+        json.dump(record, f, indent=4)
+    return out_path
+
+def benchmark_function(args: Namespace) -> list[float]:
     lm = BasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -100,3 +141,31 @@ if __name__ == "__main__":
         per_step_secs[i] = elapsed_secs
     print(per_step_secs)
     print(f"Mean: {np.mean(per_step_secs):.4f} seconds; Std: {np.std(per_step_secs)} seconds")
+    return [float(x) for x in per_step_secs]
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)  # NOTE: hard-coded for now
+    args = setup_args()
+    not_commited = subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
+    is_git_tree_dirty = bool(not_commited)
+    if is_git_tree_dirty and not args.debug:
+        print("Git tree is dirty. Please commit your changes before running the benchmark.")
+        exit(1)  # NOTE: exit status 1 indicates failure
+    if args.model_size is not None:
+        print(f"Updating args with model size: {args.model_size}")
+        args = update_args_with_model_size(args, args.model_size)
+    print(f"Measuring performance of {args.func_to_time} on device: {args.device} (sync == {args.sync})")
+    pprint(f"Args: {vars(args)}")
+    try:
+        per_step_secs = benchmark_function(args)
+        status = "success"
+    except Exception as e:
+        print(f"Error: {e}")
+        per_step_secs = []
+        status = "error"
+    if args.debug:
+        status = "debug"
+    provenance = get_provenance_info()
+    record = build_record(args, provenance, per_step_secs, status)
+    out_path = save_record(record, folder_name=args.sweep_name)
+    print(f"Saved record to {out_path}")
