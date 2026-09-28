@@ -1,9 +1,12 @@
+import json
 import torch
 import timeit
 import logging
 import argparse
 import subprocess
 import numpy as np
+import pandas as pd
+from pprint import pprint
 from functools import partial
 from torch.optim.optimizer import Optimizer
 from argparse import ArgumentParser, Namespace
@@ -18,12 +21,21 @@ def setup_args() -> Namespace:
     args.add_argument("--num_layers", type=int, default=12)
     args.add_argument("--num_heads", type=int, default=12)
     args.add_argument("--d_ff", type=int, default=3072)
+    args.add_argument("--model_size", type=str, default=None, help="Model size to benchmark. If provided, will override the hyperparameters specified above. Choices: small, medium, large, xl, 10B")
     args.add_argument("--w_steps", type=int, default=5, help="Number of warm-up steps before measuring time")
     args.add_argument("--n_steps", type=int, default=10, help="Number of measurement steps")
     args.add_argument("--device", type=torch.device, required=True, help="e.g., cpu, cuda:0, cuda:1, ...")
     args.add_argument("--sync", action=argparse.BooleanOptionalAction, required=True, help="Whether to call torch.cuda.synchronize() after each step")
     args.add_argument("--func_to_time", type=str, required=True, choices=["forward", "forward_backward", "forward_backward_optimizer"])
+    args.add_argument("--debug", action="store_true", help="Debug mode.")
     return args.parse_args()
+
+def update_args_with_model_size(args: Namespace, model_size: str) -> Namespace:
+    df = pd.read_csv("configs/model_sizes.csv", index_col=0)
+    hparams = df.loc[model_size].to_dict()
+    for k, v in hparams.items():
+        setattr(args, k, v)
+    return args
 
 def forward(lm: BasicsTransformerLM, x: torch.Tensor) -> None:
     _ = lm(x)
@@ -41,14 +53,18 @@ def forward_backward_optimizer(lm: BasicsTransformerLM, x: torch.Tensor, y: torc
     optimizer.zero_grad()
 
 if __name__ == "__main__":
-    not_commited = subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
-    is_git_tree_dirty = bool(not_commited)
-    if is_git_tree_dirty:
-        print("Git tree is dirty. Please commit your changes before running the benchmark.")
-        exit(1)  # NOTE: exit status 1 indicates failure
     logging.basicConfig(level=logging.INFO)  # NOTE: hard-coded for now
     args = setup_args()
+    not_commited = subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
+    is_git_tree_dirty = bool(not_commited)
+    if is_git_tree_dirty and not args.debug:
+        print("Git tree is dirty. Please commit your changes before running the benchmark.")
+        exit(1)  # NOTE: exit status 1 indicates failure
+    if args.model_size is not None:
+        print(f"Updating args with model size: {args.model_size}")
+        args = update_args_with_model_size(args, args.model_size)
     print(f"Measuring performance of {args.func_to_time} on device: {args.device} (sync == {args.sync})")
+    pprint(f"Args: {vars(args)}")
     lm = BasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
