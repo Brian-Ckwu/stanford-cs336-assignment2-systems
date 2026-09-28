@@ -3,6 +3,8 @@ import timeit
 import logging
 import argparse
 import numpy as np
+from functools import partial
+from torch.optim.optimizer import Optimizer
 from argparse import ArgumentParser, Namespace
 
 from cs336_basics.model import BasicsTransformerLM
@@ -22,21 +24,31 @@ def setup_args() -> Namespace:
     args.add_argument("--func_to_time", type=str, required=True, choices=["forward", "forward_backward", "forward_backward_optimizer"])
     return args.parse_args()
 
-def forward_only(lm: BasicsTransformerLM, x: torch.Tensor, sync: bool = True, device: str = torch.device("cuda:0")) -> None:
+def forward(lm: BasicsTransformerLM, x: torch.Tensor, sync: bool = True, device: str = torch.device("cuda:0")) -> None:
     _ = lm(x)
     if sync:
         torch.cuda.synchronize(device)
 
-func_to_time = {
-    "forward": forward_only,
-    "forward_backward": NotImplemented,
-    "forward_backward_optimizer": NotImplemented
-}
+def forward_backward(lm: BasicsTransformerLM, x: torch.Tensor, y: torch.Tensor, sync: bool = True, device: str = torch.device("cuda:0")) -> None:
+    logits = lm(x)  # shape = (batch_size, seq_length, vocab_size)
+    loss = torch.nn.functional.cross_entropy(input=logits.view(-1, logits.shape[-1]), target=y.view(-1))
+    loss.backward()
+    if sync:
+        torch.cuda.synchronize(device)
+
+def forward_backward_optimizer(lm: BasicsTransformerLM, x: torch.Tensor, y: torch.Tensor, optimizer: Optimizer, sync: bool = True, device: str = torch.device("cuda:0")) -> None:
+    logits = lm(x)  # shape = (batch_size, seq_length, vocab_size)
+    loss = torch.nn.functional.cross_entropy(input=logits.view(-1, logits.shape[-1]), target=y.view(-1))
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    if sync:
+        torch.cuda.synchronize(device)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)  # NOTE: hard-coded for now
     args = setup_args()
-    print(f"Measuring performance on device: {args.device} (sync == {args.sync})")
+    print(f"Measuring performance of {args.func_to_time} on device: {args.device} (sync == {args.sync})")
     lm = BasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -47,16 +59,24 @@ if __name__ == "__main__":
     ).to(args.device)
     # Generate a random batch of data
     x = torch.randint(low=0, high=args.vocab_size, size=(4, 512)).to(args.device)
+    y = torch.randint(low=0, high=args.vocab_size, size=(4, 512)).to(args.device)
+    optimizer = torch.optim.AdamW(params=lm.parameters())
     # Select the function to time
-    func = func_to_time[args.func_to_time]
+    match args.func_to_time:
+        case "forward":
+            func = partial(forward, lm, x, sync=args.sync, device=args.device)
+        case "forward_backward":
+            func = partial(forward_backward, lm, x, y, sync=args.sync, device=args.device)
+        case "forward_backward_optimizer":
+            func = partial(forward_backward_optimizer, lm, x, y, optimizer, sync=args.sync, device=args.device)
     # Warm-up steps
     for _ in range(args.w_steps):
-        func(lm, x, sync=True if args.device != torch.device("cpu") else False, device=args.device)
+        func()
     # Measurement
     per_step_secs = [None] * args.n_steps
     for i in range(args.n_steps):
         start = timeit.default_timer()
-        func(lm, x, sync=args.sync, device=args.device)
+        func()
         elapsed_secs = timeit.default_timer() - start
         per_step_secs[i] = elapsed_secs
     print(per_step_secs)
